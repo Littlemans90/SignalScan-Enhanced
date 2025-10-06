@@ -1,7 +1,7 @@
 """
-SignalScan - Real-Time Stock Scanner with WebSocket Integration
-Version 4.0 FINAL - Production Ready for 24/7 Operation
-Finnhub WebSocket + Yahoo Finance Indices + Smart On-Demand News
+SignalScan Enhanced - Full US Market Scanner (8,000+ Stocks)
+Version 5.0 - yfinance Bulk Scanning + Optional Finnhub WebSocket
+Scans entire US market every 5 minutes via yfinance multithreading
 """
 
 from kivy.app import App
@@ -20,9 +20,7 @@ from dotenv import load_dotenv
 import threading
 import time
 import requests
-import json
-import websocket
-import ssl
+import pandas as pd
 import yfinance as yf
 
 load_dotenv()
@@ -35,7 +33,7 @@ Config.write()
 
 
 class NewsManager:
-    """Manages breaking news: Finnhub ONLY (24/7 unlimited) - SMART ON-DEMAND"""
+    """Manages breaking news from Finnhub"""
 
     def __init__(self, callback, watchlist=None):
         self.callback = callback
@@ -59,13 +57,14 @@ class NewsManager:
             'eps below expectations', 'record profit', 'record loss', 'upgrade',
             'sec investigation', 'lawsuit settlement', 'antitrust', 'sanctions',
             'rate hike', 'rate cut',
-            'jumps', 'drops', 'hits new 52-week', 'unusual volume'
+            'jumps', 'drops', 'hits new 52-week', 'unusual volume',
+            'crypto', 'cryptocurrency'
         ]
 
     def start_news_stream(self):
         self.running = True
         threading.Thread(target=self._finnhub_news_loop, daemon=True).start()
-        print("Starting Finnhub news monitoring (24/7)...")
+        print("Starting Finnhub news monitoring...")
 
     def _finnhub_news_loop(self):
         while self.running:
@@ -79,6 +78,8 @@ class NewsManager:
     def fetch_finnhub_news(self):
         """Fetch general market news"""
         try:
+            if not self.finnhub_key:
+                return
             url = f"https://finnhub.io/api/v1/news?category=general&token={self.finnhub_key}"
             response = requests.get(url, timeout=5)
             data = response.json()
@@ -91,25 +92,39 @@ class NewsManager:
             print(f"Finnhub general news fetch error: {e}")
 
     def fetch_company_news_on_demand(self, symbol):
-        """SMART: Fetch company-specific news when stock becomes channel candidate"""
+        """Fetch company-specific news when stock becomes channel candidate"""
         symbol = symbol.upper()
-        if symbol in self.company_news_fetched:
+        if symbol in self.company_news_fetched or not self.finnhub_key:
             return
 
         try:
             to_date = datetime.datetime.now().strftime('%Y-%m-%d')
             from_date = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
 
-            url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={self.finnhub_key}"
+            url = (
+                f"https://finnhub.io/api/v1/company-news?"
+                f"symbol={symbol}&from={from_date}&to={to_date}&token={self.finnhub_key}"
+            )
             response = requests.get(url, timeout=5)
             data = response.json()
 
             if isinstance(data, list) and len(data) > 0:
                 for article in data[:3]:
-                    if 'related' not in article or not article['related']:
+                    # Ensure 'related' includes the symbol
+                    related = article.get('related')
+                    if not related:
                         article['related'] = symbol
-                    elif symbol not in article['related']:
-                        article['related'] = f"{article['related']},{symbol}"
+                    else:
+                        # If related is a list, join it; if string, ensure symbol is included
+                        if isinstance(related, list):
+                            related_list = [r.strip().upper() for r in related if r]
+                            if symbol not in related_list:
+                                related_list.append(symbol)
+                            article['related'] = ",".join(related_list)
+                        else:
+                            related_str = str(related)
+                            if symbol not in related_str.upper():
+                                article['related'] = f"{related_str},{symbol}"
 
                     self.process_news_article(article, source='company')
 
@@ -119,14 +134,15 @@ class NewsManager:
             print(f"Company news error for {symbol}: {e}")
 
     def process_news_article(self, article, source='general'):
-        """Process and allocate news ONLY to related symbols"""
+        """Process and allocate news to related symbols"""
         try:
-            title = article.get('headline', '') or article.get('title', '')
-            content = article.get('summary', '') or article.get('description', '')
-            related_str = article.get('related', '') or article.get('symbols', '')
+            title = article.get('headline') or article.get('title') or ''
+            content = article.get('summary') or article.get('description') or ''
+            related_raw = article.get('related') or article.get('symbols') or ''
             article_id = article.get('id') or article.get('url') or ''
-            timestamp = article.get('datetime', 0)
+            timestamp = article.get('datetime') or article.get('time') or 0
 
+            # Normalize article id
             if not article_id:
                 article_id = f"{title[:80]}::{timestamp}"
 
@@ -137,17 +153,21 @@ class NewsManager:
             headline_content = (title + " " + content).lower()
             is_breaking = any(keyword.lower() in headline_content for keyword in self.breaking_keywords)
 
-            if related_str:
-                symbols = [s.strip().upper() for s in related_str.split(',') if s.strip()]
-            else:
-                symbols = []
+            # Normalize related symbols into list
+            symbols = []
+            if related_raw:
+                if isinstance(related_raw, list):
+                    symbols = [s.strip().upper() for s in related_raw if s]
+                else:
+                    symbols = [s.strip().upper() for s in str(related_raw).split(',') if s.strip()]
 
             matched_symbols = [s for s in symbols if s in self.watchlist]
 
+            # If no matched symbols, but breaking crypto news, broadcast to a few watchlist symbols
             if not matched_symbols:
                 is_crypto_news = "crypto" in headline_content or "cryptocurrency" in headline_content
-
-                if is_breaking and is_crypto_news:
+                if is_breaking and is_crypto_news and self.watchlist:
+                    # schedule a small set of fake 'crypto' news for a few watchlist symbols
                     for symbol in list(self.watchlist)[:3]:
                         news_data = {
                             'symbol': symbol,
@@ -156,9 +176,11 @@ class NewsManager:
                             'is_breaking': True,
                             'timestamp': timestamp
                         }
+                        # Schedule UI callback safely on Kivy's clock
                         Clock.schedule_once(lambda dt, nd=news_data: self.callback(nd), 0)
                 return
 
+            # Send news to matched symbols
             for symbol in matched_symbols:
                 if symbol.startswith("CRYPTO:") or symbol.startswith("FOREX:"):
                     continue
@@ -180,217 +202,194 @@ class NewsManager:
 
 
 class MarketDataManager:
-    """Manages Finnhub WebSocket + Yahoo Finance Indices"""
+    """Manages yfinance bulk scanning for 8,000+ stocks"""
 
     def __init__(self, callback, news_manager_ref=None):
         self.callback = callback
         self.news_manager_ref = news_manager_ref
-        self.finnhub_key = os.getenv('FINNHUB_API_KEY')
-        self.ws = None
         self.running = False
         self.stock_data = {}
-        self.watchlist = []
-        self.stock_metrics = {}
-        self.seeding_complete = False
+        self.all_us_tickers = []
         self.market_open_time = None
+        self.scan_count = 0
 
-    def fetch_all_tradable_stocks(self):
-        """Fetch top 100 US stocks"""
-        print("Loading top 100 US stocks...")
-        self.watchlist = [
+    def fetch_all_us_tickers(self):
+        """Fetch ALL US stock tickers from NASDAQ FTP"""
+        print("Fetching complete US stock universe from NASDAQ...")
+        try:
+            # NASDAQ listed stocks
+            nasdaq_url = 'ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt'
+            nasdaq_df = pd.read_csv(nasdaq_url, sep='|', dtype=str, skiprows=1, engine='python', error_bad_lines=False)
+            nasdaq_tickers = nasdaq_df[nasdaq_df.get('Test Issue') == 'N']['Symbol'].tolist()
+
+            # NYSE/AMEX stocks
+            other_url = 'ftp://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt'
+            other_df = pd.read_csv(other_url, sep='|', dtype=str, skiprows=1, engine='python', error_bad_lines=False)
+            # 'ACT Symbol' column used in otherlisted file
+            other_tickers = other_df[other_df.get('Test Issue') == 'N']['ACT Symbol'].tolist()
+
+            # Combine and clean
+            all_tickers = list(set((nasdaq_tickers or []) + (other_tickers or [])))
+            # Remove invalid symbols
+            all_tickers = [t for t in all_tickers if t and not str(t).startswith('$') and len(str(t)) <= 5]
+
+            self.all_us_tickers = sorted(all_tickers)
+            print(f"Loaded {len(self.all_us_tickers)} US stock tickers")
+
+        except Exception as e:
+            print(f"Error fetching ticker universe: {e}")
+            print("Falling back to top 500 stocks...")
+            self.all_us_tickers = self._get_fallback_tickers()
+
+    def _get_fallback_tickers(self):
+        """Fallback to curated list if NASDAQ FTP fails"""
+        return [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B', 'UNH', 'JNJ',
             'V', 'XOM', 'WMT', 'LLY', 'JPM', 'PG', 'MA', 'HD', 'CVX', 'ABBV',
-            'MRK', 'AVGO', 'KO', 'PEP', 'COST', 'ADBE', 'MCD', 'CSCO', 'CRM', 'ACN',
-            'TMO', 'NFLX', 'ABT', 'DHR', 'LIN', 'VZ', 'TXN', 'INTC', 'NKE', 'AMD',
-            'QCOM', 'PM', 'WFC', 'UPS', 'RTX', 'NEE', 'ORCL', 'HON', 'SPGI', 'INTU',
-            'LOW', 'IBM', 'CAT', 'BA', 'GE', 'ELV', 'AMGN', 'NOW', 'GS', 'ISRG',
-            'DE', 'BLK', 'SYK', 'AXP', 'BKNG', 'GILD', 'ADI', 'MDLZ', 'TJX', 'MMC',
-            'VRTX', 'PLD', 'CB', 'SCHW', 'LRCX', 'SBUX', 'CI', 'AMT', 'SLB', 'TMUS',
-            'ZTS', 'MO', 'REGN', 'PYPL', 'CVS', 'BMY', 'DUK', 'FI', 'SO', 'EQIX',
-            'PGR', 'BDX', 'ITW', 'AON', 'APD', 'CL', 'ETN', 'MU', 'BSX', 'SHW'
         ]
-        print(f"Loaded {len(self.watchlist)} stocks")
 
-    def load_stock_metrics_batch(self):
-        """Load stock metrics + seed volume BEFORE WebSocket connects"""
-        print("Loading stock metrics + seeding volume (approx 2 minutes)...")
-
-        watchlist = self.watchlist
-        finnhub_key = self.finnhub_key
-        stock_data = self.stock_data
-        stock_metrics = self.stock_metrics
-        parent_self = self
-
-        def batch_load():
-            for i, symbol in enumerate(watchlist):
-                try:
-                    quote_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={finnhub_key}"
-                    quote_response = requests.get(quote_url, timeout=5)
-                    quote_data = quote_response.json()
-
-                    profile_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={finnhub_key}"
-                    profile_response = requests.get(profile_url, timeout=5)
-                    profile_data = profile_response.json()
-
-                    todays_volume = float(quote_data.get('v', 0)) if quote_data.get('v') else 0
-
-                    if todays_volume == 0:
-                        try:
-                            ticker = yf.Ticker(symbol)
-                            info = ticker.info or {}
-                            todays_volume = float(info.get('volume', info.get('regularMarketVolume', 0) or 0))
-                        except Exception:
-                            todays_volume = 0
-
-                    prev_close = float(quote_data.get('pc', 0) or 0)
-                    current_price = float(quote_data.get('c', prev_close) or prev_close)
-
-                    stock_data[symbol] = {
-                        'volume': todays_volume,
-                        'price': current_price,
-                        'timestamp': time.time()
-                    }
-
-                    market_cap = float(profile_data.get('marketCapitalization', 0) or 0)
-
-                    avg_volume_estimate = None
-                    try:
-                        ticker = yf.Ticker(symbol)
-                        info = ticker.info or {}
-                        avg_volume_estimate = float(info.get('averageVolume', info.get('averageDailyVolume10Day', 0) or 0))
-                    except Exception:
-                        avg_volume_estimate = None
-
-                    if not avg_volume_estimate or avg_volume_estimate == 0:
-                        if todays_volume > 0:
-                            avg_volume_estimate = max(int(todays_volume * 1.5), 1)
-                        elif market_cap > 0:
-                            if market_cap > 1000:
-                                avg_volume_estimate = 80_000_000
-                            elif market_cap > 100:
-                                avg_volume_estimate = 50_000_000
-                            elif market_cap > 10:
-                                avg_volume_estimate = 10_000_000
-                            else:
-                                avg_volume_estimate = 5_000_000
-                        else:
-                            avg_volume_estimate = 50_000_000
-
-                    stock_metrics[symbol] = {
-                        'prev_close': prev_close,
-                        'avg_volume': avg_volume_estimate,
-                        'float': float(profile_data.get('shareOutstanding', 0) or 0)
-                    }
-
-                    if (i + 1) % 10 == 0:
-                        print(f"Loaded {i + 1}/{len(watchlist)} stocks...")
-
-                    time.sleep(1.2)
-
-                except Exception as e:
-                    print(f"Error loading {symbol}: {e}")
-                    stock_metrics[symbol] = {
-                        'prev_close': None,
-                        'avg_volume': 50_000_000,
-                        'float': None
-                    }
-
-            parent_self.seeding_complete = True
-            print("Stock metrics loaded + volume seeded successfully")
-
-        threading.Thread(target=batch_load, daemon=True).start()
-
-    def start_websocket(self):
-        """Start Finnhub WebSocket connection"""
-        self.fetch_all_tradable_stocks()
-        self.load_stock_metrics_batch()
+    def start_bulk_scanner(self):
+        """Start the bulk yfinance scanner"""
+        self.fetch_all_us_tickers()
         self.running = True
 
         est = pytz.timezone('US/Eastern')
         now_est = datetime.datetime.now(est)
         self.market_open_time = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
 
-        thread = threading.Thread(target=self._run_websocket, daemon=True)
-        thread.start()
+        # Start scanning loop
+        threading.Thread(target=self._bulk_scan_loop, daemon=True).start()
+        print("Starting yfinance bulk scanner (5-minute refresh)...")
 
-        print("Starting Finnhub WebSocket connection...")
-
-    def _run_websocket(self):
-        """Run Finnhub WebSocket connection"""
-        def on_message(ws, message):
+    def _bulk_scan_loop(self):
+        """Continuously scan all stocks every 5 minutes"""
+        while self.running:
             try:
-                data = json.loads(message)
-                if data.get('type') == 'trade':
-                    for trade in data.get('data', []):
-                        symbol = trade.get('s', '')
-                        price = trade.get('p', 0)
-                        volume = trade.get('v', 0)
-                        timestamp = trade.get('t', 0)
+                self.scan_count += 1
+                print(f"\n=== SCAN #{self.scan_count} - Downloading {len(self.all_us_tickers)} stocks ===")
+                start_time = time.time()
 
-                        if not self.seeding_complete:
-                            continue
+                self.bulk_download_and_process()
 
-                        if symbol not in self.stock_data:
-                            self.stock_data[symbol] = {'volume': 0, 'price': price, 'timestamp': timestamp}
+                elapsed = time.time() - start_time
+                print(f"Scan completed in {elapsed:.1f} seconds")
 
-                        current_volume = self.stock_data[symbol].get('volume', 0)
-                        self.stock_data[symbol]['volume'] = current_volume + volume
-                        self.stock_data[symbol]['price'] = price
-                        self.stock_data[symbol]['timestamp'] = timestamp
+                # Wait 5 minutes before next scan
+                time.sleep(300)
 
-                        if self.callback:
-                            Clock.schedule_once(
-                                lambda dt, s=symbol, d=self.stock_data[symbol]: self.callback(s, d),
-                                0
-                            )
             except Exception as e:
-                print(f"WebSocket message error: {e}")
+                print(f"Bulk scan error: {e}")
+                time.sleep(60)
 
-        def on_error(ws, error):
-            print(f"WebSocket error: {error}")
+    def bulk_download_and_process(self):
+        """Download all stocks and process into channels"""
+        try:
+            if not self.all_us_tickers:
+                print("No tickers available to download")
+                return
 
-        def on_close(ws, close_status_code, close_msg):
-            print(f"WebSocket closed: {close_status_code} - {close_msg}")
-            if self.running:
-                print("Reconnecting WebSocket in 5 seconds...")
-                time.sleep(5)
-                self._run_websocket()
+            # Bulk download with multithreading (yfinance)
+            print("Downloading bulk data from Yahoo Finance...")
+            try:
+                data = yf.download(
+                    tickers=self.all_us_tickers,
+                    period="1d",
+                    interval="1m",
+                    group_by="ticker",
+                    threads=True,
+                    progress=False
+                )
+            except Exception:
+                data = None
 
-        def on_open(ws):
-            print("Finnhub WebSocket connected successfully")
-            for symbol in self.watchlist:
+            processed_count = 0
+
+            # Process each stock individually using Ticker object
+            for symbol in self.all_us_tickers:
                 try:
-                    ws.send(json.dumps({'type': 'subscribe', 'symbol': symbol}))
-                except Exception as err:
-                    print(f"Error subscribing to {symbol}: {err}")
+                    ticker_obj = yf.Ticker(symbol)
 
-        websocket.enableTrace(False)
-        ws_url = f"wss://ws.finnhub.io?token={self.finnhub_key}"
-        self.ws = websocket.WebSocketApp(
-            ws_url,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-            on_open=on_open
-        )
+                    # Get intraday data
+                    hist = ticker_obj.history(period="1d", interval="1m")
+                    if hist is None or hist.empty:
+                        continue
 
-        self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                    # Get current price and volume
+                    current_price = float(hist['Close'].iloc[-1])
+                    current_volume = int(hist['Volume'].sum())  # Total volume for the day
 
-    def get_stock_metrics(self, symbol):
-        """Get cached stock metrics"""
-        return self.stock_metrics.get(symbol, {
-            'prev_close': None,
-            'avg_volume': 50_000_000,
-            'float': None
-        })
+                    if current_price == 0 or current_volume == 0:
+                        continue
 
-    def calculate_rvol(self, symbol, current_volume):
+                    # Get info for prev_close, avg_volume, float
+                    info = {}
+                    try:
+                        info = ticker_obj.info or {}
+                    except Exception:
+                        info = {}
+
+                    prev_close = float(info.get('previousClose', info.get('regularMarketPreviousClose', current_price)))
+                    avg_volume = float(info.get('averageVolume', info.get('averageDailyVolume10Day', 50_000_000)))
+                    shares_outstanding = float(info.get('sharesOutstanding', 0))
+                    float_shares = (shares_outstanding / 1_000_000) if shares_outstanding else 0.0  # Convert to millions
+
+                    # Calculate metrics
+                    if prev_close > 0:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100
+                    else:
+                        change_pct = 0.0
+
+                    # Calculate RVOL
+                    rvol = self.calculate_rvol(current_volume, avg_volume)
+
+                    # Store data
+                    self.stock_data[symbol] = {
+                        'price': current_price,
+                        'volume': current_volume,
+                        'prev_close': prev_close,
+                        'change_pct': change_pct,
+                        'avg_volume': avg_volume,
+                        'float': float_shares,
+                        'rvol': rvol,
+                        'timestamp': time.time()
+                    }
+
+                    # Trigger news fetch for strong candidates
+                    if self.is_strong_channel_candidate(symbol, change_pct, rvol):
+                        if self.news_manager_ref:
+                            threading.Thread(
+                                target=self.news_manager_ref.fetch_company_news_on_demand,
+                                args=(symbol,),
+                                daemon=True
+                            ).start()
+
+                    # Send to UI callback
+                    if self.callback:
+                        print(f"[CALLBACK SCHEDULED] {symbol}: ${current_price:.2f}, change={change_pct:+.1f}%, rvol={rvol:.2f}x")
+                        Clock.schedule_once(
+                            lambda dt, s=symbol, d=self.stock_data[symbol]: self.callback(s, d),
+                            0
+                        )
+
+                    processed_count += 1
+
+                    # Print progress every 100 stocks
+                    if processed_count % 100 == 0:
+                        print(f"Processed {processed_count} stocks...")
+
+                except Exception:
+                    # Skip problematic symbols silently (keeps scanner robust)
+                    continue
+
+            print(f"Processed {processed_count} stocks successfully")
+
+        except Exception as e:
+            print(f"Bulk download error: {e}")
+
+    def calculate_rvol(self, current_volume, avg_volume):
         """Calculate time-adjusted RVOL"""
         try:
-            metrics = self.get_stock_metrics(symbol)
-            avg_daily_volume = metrics.get('avg_volume', 50_000_000)
-
-            if avg_daily_volume <= 0 or current_volume <= 0:
+            if avg_volume <= 0 or current_volume <= 0:
                 return 0.0
 
             est = pytz.timezone('US/Eastern')
@@ -406,20 +405,19 @@ class MarketDataManager:
                 else:
                     expected_ratio = min(elapsed_minutes / 390, 1.0)
 
-                expected_volume = avg_daily_volume * expected_ratio
+                expected_volume = avg_volume * expected_ratio
 
                 if expected_volume > 0:
-                    rvol = current_volume / expected_volume
-                    return rvol
+                    return current_volume / expected_volume
 
-            return current_volume / avg_daily_volume
+            # Fallback to simple ratio
+            return current_volume / avg_volume
 
-        except Exception as e:
-            print(f"RVOL calc error for {symbol}: {e}")
+        except Exception:
             return 0.0
 
     def is_strong_channel_candidate(self, symbol, change_pct, rvol):
-        """SMART: Determine if stock is strong channel candidate worthy of company news"""
+        """Determine if stock needs company news"""
         if abs(change_pct) > 5:
             return True
         if change_pct > 2:
@@ -442,8 +440,12 @@ class MarketDataManager:
 
             if hist is not None and not hist.empty:
                 current_price = float(hist['Close'].iloc[-1])
-                info = ticker.info or {}
-                prev_close = float(info.get('previousClose', info.get('regularMarketPreviousClose', current_price) or current_price))
+                info = {}
+                try:
+                    info = ticker.info or {}
+                except Exception:
+                    info = {}
+                prev_close = float(info.get('previousClose', info.get('regularMarketPreviousClose', current_price)))
 
                 if prev_close > 0:
                     change_pct = ((current_price - prev_close) / prev_close) * 100
@@ -457,13 +459,8 @@ class MarketDataManager:
         return 0.0, 0.0
 
     def stop(self):
-        """Stop WebSocket connection"""
+        """Stop scanner"""
         self.running = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
 
 
 class SignalScanApp(BoxLayout):
@@ -493,7 +490,7 @@ class SignalScanApp(BoxLayout):
         self.sp_last, self.sp_pct = 0.0, 0.0
 
         self.news_manager = None
-        self.market_data = MarketDataManager(callback=self.on_websocket_update, news_manager_ref=None)
+        self.market_data = MarketDataManager(callback=self.on_data_update, news_manager_ref=None)
 
         self.build_header()
         main_content = BoxLayout(orientation="vertical", spacing=0, padding=0)
@@ -514,23 +511,24 @@ class SignalScanApp(BoxLayout):
 
     def start_market_data(self, dt=None):
         """Initialize market data streams"""
-        print("Starting market data streams...")
-        self.market_data.start_websocket()
+        print("Starting yfinance bulk market scanner...")
+        self.market_data.start_bulk_scanner()
 
     def start_news_feed(self, dt=None):
         """Initialize news feed"""
-        wl = [s.upper() for s in self.market_data.watchlist] if self.market_data.watchlist else []
+        wl = self.market_data.all_us_tickers or []
         self.news_manager = NewsManager(callback=self.on_news_update, watchlist=wl)
         self.market_data.news_manager_ref = self.news_manager
         self.news_manager.start_news_stream()
 
-    def on_websocket_update(self, symbol, data):
-        """Callback when WebSocket receives new data"""
+    def on_data_update(self, symbol, data):
+        """Callback when scanner processes new stock data"""
+        print(f"[UI CALLBACK RECEIVED] {symbol}: {data}")
         self.process_stock_update(symbol, data)
 
     def on_news_update(self, news_data):
         """Callback when breaking news arrives"""
-        symbol = news_data['symbol']
+        symbol = news_data.get('symbol', '')
         title = news_data.get('title', '')
         is_breaking = news_data.get('is_breaking', False)
 
@@ -544,42 +542,28 @@ class SignalScanApp(BoxLayout):
         Clock.schedule_once(lambda dt: self.refresh_data_table(), 0)
 
     def process_stock_update(self, symbol, data):
-        """Process stock data update and categorize"""
+        """Process stock data and categorize"""
+        print(f"[PROCESSING] {symbol}")
         try:
             price = data.get('price', 0)
             volume = data.get('volume', 0)
+            change_pct = data.get('change_pct', 0)
+            float_shares = data.get('float', 0)
+            rvol = data.get('rvol', 0)
 
             if price == 0:
                 return
 
-            metrics = self.market_data.get_stock_metrics(symbol)
-            prev_close = metrics.get('prev_close')
-            float_shares = metrics.get('float')
-
-            if prev_close and prev_close > 0:
-                change_pct = ((price - prev_close) / prev_close * 100)
-            else:
-                change_pct = 0.0
-            
-            if float_shares and float_shares > 0:
-                # Finnhub returns shareOutstanding already in millions
-                if float_shares >= 1000:  # 1000 million = 1 billion
+            # Format float
+            if float_shares > 0:
+                if float_shares >= 1000:
                     float_str = f"{float_shares/1000:.1f}B"
                 else:
                     float_str = f"{float_shares:.1f}M"
             else:
                 float_str = "N/A"
 
-            rvol = self.market_data.calculate_rvol(symbol, volume)
             rvol_str = f"{rvol:.2f}x" if rvol > 0 else "0.00x"
-
-            if self.market_data.is_strong_channel_candidate(symbol, change_pct, rvol):
-                if self.news_manager and symbol not in self.news_manager.company_news_fetched:
-                    threading.Thread(
-                        target=self.news_manager.fetch_company_news_on_demand,
-                        args=(symbol,),
-                        daemon=True
-                    ).start()
 
             formatted_data = [
                 symbol,
@@ -591,21 +575,21 @@ class SignalScanApp(BoxLayout):
                 ""
             ]
 
-            self.categorize_stock(formatted_data, change_pct, volume)
-            Clock.schedule_once(lambda dt: self.refresh_data_table(), 0)
+            self.categorize_stock(formatted_data, change_pct, volume, rvol)
 
         except Exception as e:
             print(f"Error processing {symbol}: {e}")
 
-    def categorize_stock(self, stock_data, change_pct, volume):
+    def categorize_stock(self, stock_data, change_pct, volume, rvol):
         """Categorize stock into scanner channels"""
         ticker = stock_data[0]
+        print(f"[CATEGORIZE] {ticker}: change={change_pct:+.1f}%, rvol={rvol:.2f}x")
 
-        # remove existing entries for ticker across channels
+        # Remove existing entries from all channels
         for channel in self.live_data:
             self.live_data[channel] = [s for s in self.live_data[channel] if s[0] != ticker]
 
-        # Categorize into channels (these are additive)
+        # Categorize (additive)
         if abs(change_pct) > 5:
             self.live_data["PreGap"].append(stock_data)
         if change_pct > 2:
@@ -614,15 +598,23 @@ class SignalScanApp(BoxLayout):
             self.live_data["RunUp"].append(stock_data)
         if change_pct < 0:
             self.live_data["RunDown"].append(stock_data)
-        if volume > 1_000_000:
+        if rvol > 2.0:
             self.live_data["Rvsl"].append(stock_data)
 
+        # Sort by RVOL (column 5, e.g., '1.23x')
+        for channel in self.live_data:
+            try:
+                self.live_data[channel].sort(key=lambda x: float(str(x[5]).replace('x', '')), reverse=True)
+            except Exception:
+                pass
+
+        Clock.schedule_once(lambda dt: self.refresh_data_table(), 0)
+
     def update_indices(self, dt=None):
-        """Update NASDAQ and S&P 500 data via Yahoo Finance"""
+        """Update NASDAQ and S&P 500"""
         self.nasdaq_last, self.nasdaq_pct = self.market_data.get_index_data(".IXIC")
         self.sp_last, self.sp_pct = self.market_data.get_index_data(".SPX")
 
-        # Labels may not exist immediately; guard access
         try:
             self.nasdaq_label.text = f"NASDAQ  {self.nasdaq_pct:+.1f}%"
             self.nasdaq_label.color = (0, 1, 0, 1) if self.nasdaq_pct > 0 else (1, 0, 0, 1)
@@ -669,7 +661,7 @@ class SignalScanApp(BoxLayout):
         header.bind(size=lambda inst, val: setattr(header.bg_rect, "size", inst.size))
         header.bind(pos=lambda inst, val: setattr(header.bg_rect, "pos", inst.pos))
 
-        title = Label(text="SignalScan", font_size=28, color=(1, 1, 1, 1), bold=True, size_hint=(None, 1), width=180)
+        title = Label(text="SignalScan ENHANCED", font_size=26, color=(0, 1, 0, 1), size_hint=(None, 1), width=240)
         header.add_widget(title)
 
         times_section = BoxLayout(orientation="vertical", spacing=5, size_hint=(None, 1), width=160)
@@ -680,15 +672,15 @@ class SignalScanApp(BoxLayout):
         header.add_widget(times_section)
 
         center_section = BoxLayout(orientation="vertical", spacing=5, size_hint=(None, 1), width=160)
-        self.market_state_label = Label(text="Weekend", font_size=16, color=(1, 0.6, 0, 1), bold=True)
+        self.market_state_label = Label(text="Weekend", font_size=16, color=(1, 0.6, 0, 1))
         self.countdown_label = Label(text="00:00:00", font_size=14, color=(1, 0.6, 0, 1))
         center_section.add_widget(self.market_state_label)
         center_section.add_widget(self.countdown_label)
         header.add_widget(center_section)
 
         indicators_section = BoxLayout(orientation="vertical", spacing=5, size_hint=(None, 1), width=140)
-        self.nasdaq_label = Label(text=f"NASDAQ  +0.0%", font_size=13, color=(0, 1, 0, 1), bold=True)
-        self.sp_label = Label(text=f"S&P     +0.0%", font_size=13, color=(0, 1, 0, 1), bold=True)
+        self.nasdaq_label = Label(text=f"NASDAQ  +0.0%", font_size=13, color=(0, 1, 0, 1))
+        self.sp_label = Label(text=f"S&P     +0.0%", font_size=13, color=(0, 1, 0, 1))
         indicators_section.add_widget(self.nasdaq_label)
         indicators_section.add_widget(self.sp_label)
         header.add_widget(indicators_section)
@@ -714,7 +706,7 @@ class SignalScanApp(BoxLayout):
         self.channel_buttons = {}
 
         for channel in channels:
-            btn = Button(text=channel, font_size=16, size_hint=(1, 1), bold=True)
+            btn = Button(text=channel, font_size=16, size_hint=(1, 1))
             if channel == self.current_channel:
                 btn.background_color = (0, 0.8, 0, 1)
                 btn.color = (1, 1, 1, 1)
@@ -739,7 +731,7 @@ class SignalScanApp(BoxLayout):
 
         headers = ["TICKER", "PRICE", "GAP%", "VOL", "FLOAT", "RVOL", "NEWS"]
         for header in headers:
-            label = Label(text=header, font_size=15, color=(0.7, 0.7, 0.7, 1), bold=True)
+            label = Label(text=header, font_size=15, color=(0.7, 0.7, 0.7, 1))
             header_layout.add_widget(label)
         data_section.add_widget(header_layout)
 
@@ -753,7 +745,7 @@ class SignalScanApp(BoxLayout):
         return data_section
 
     def refresh_data_table(self):
-        """Refresh the data table with current channel stocks"""
+        """Refresh data table"""
         self.rows_container.clear_widgets()
 
         stocks = self.live_data.get(self.current_channel, [])
@@ -764,7 +756,7 @@ class SignalScanApp(BoxLayout):
                 self.rows_container.add_widget(row)
 
     def create_stock_row(self, stock_data):
-        """Create a single stock row with colored news buttons"""
+        """Create stock row with news buttons"""
         row = BoxLayout(orientation="horizontal", size_hint=(1, None), height=40)
 
         try:
@@ -794,8 +786,7 @@ class SignalScanApp(BoxLayout):
                     text_color_btn = (1, 1, 1, 1)
 
                 btn = Button(text=btn_text, font_size=12, size_hint=(1, 1),
-                             background_color=btn_color, bold=True,
-                             color=text_color_btn)
+                             background_color=btn_color, color=text_color_btn)
 
                 news_content = self.stock_news.get(ticker, {}).get('title', 'No news available')
                 btn.bind(on_release=lambda x, t=ticker, n=news_content: self.show_news_popup(t, n))
@@ -808,8 +799,7 @@ class SignalScanApp(BoxLayout):
 
     def show_news_popup(self, ticker, news_text):
         content = BoxLayout(orientation="vertical", padding=20, spacing=15)
-        title_label = Label(text=f"{ticker} - NEWS", font_size=18, bold=True,
-                            size_hint=(1, None), height=40, color=(0, 1, 0, 1))
+        title_label = Label(text=f"{ticker} - NEWS", font_size=18, size_hint=(1, None), height=40, color=(0, 1, 0, 1))
         content.add_widget(title_label)
 
         news_label = Label(text=news_text, font_size=14, text_size=(400, None),
@@ -828,10 +818,11 @@ class SignalScanApp(BoxLayout):
         for ch, btn in self.channel_buttons.items():
             btn.background_color = (0.25, 0.25, 0.25, 1)
             btn.color = (0.7, 0.7, 0.7, 1)
-        self.channel_buttons[channel].background_color = (0, 0.8, 0, 1)
-        self.channel_buttons[channel].color = (1, 1, 1, 1)
-        self.current_channel = channel
-        self.refresh_data_table()
+        if channel in self.channel_buttons:
+            self.channel_buttons[channel].background_color = (0, 0.8, 0, 1)
+            self.channel_buttons[channel].color = (1, 1, 1, 1)
+            self.current_channel = channel
+            self.refresh_data_table()
 
     def update_times(self, dt):
         now = datetime.datetime.now()
