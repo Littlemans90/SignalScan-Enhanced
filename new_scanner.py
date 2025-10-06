@@ -1,6 +1,6 @@
 """
 SignalScan Enhanced - Full US Market Scanner
-Version 7.2 - Halts with Price/% + News (sound exempt) + PyGame Audio
+Version 7.3 - Time-Restricted Sound Alerts + PyGame Audio
 """
 
 from kivy.app import App
@@ -36,11 +36,11 @@ NY_TZ = pytz.timezone('America/New_York')
 
 
 class SoundManager:
-    """Manages sound alerts using PyGame mixer"""
+    """Manages sound alerts using PyGame mixer with time restrictions"""
     def __init__(self):
         # Initialize PyGame mixer for audio playback
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
-        pygame.mixer.set_num_channels(8)  # Allow multiple sounds simultaneously
+        pygame.mixer.set_num_channels(8)
         
         self.sounds = {}
         self.sound_dir = "sounds"
@@ -68,7 +68,22 @@ class SoundManager:
             else:
                 print(f"✗ Missing: {filepath}")
 
+    def is_sound_allowed(self):
+        """Check if sounds are allowed based on time (7 AM - 8 PM ET)"""
+        now_est = datetime.datetime.now(NY_TZ)
+        start_hour = 7
+        end_hour = 20
+        
+        if start_hour <= now_est.hour < end_hour:
+            return True
+        else:
+            return False
+
     def play_sound(self, sound_name):
+        if not self.is_sound_allowed():
+            print(f"[SOUND] {sound_name} muted (quiet hours)")
+            return
+        
         if sound_name in self.sounds:
             try:
                 self.sounds[sound_name].play()
@@ -151,9 +166,7 @@ class HaltManager:
             r.raise_for_status()
             
             root = ET.fromstring(r.content)
-            
             today_et = datetime.datetime.now(NY_TZ).date()
-            
             self.halt_data = {}
             
             for item in root.findall('.//item'):
@@ -365,9 +378,8 @@ class NewsManager:
             live_data = app.root.live_data
             ticker_on_channel = False
             
-            # Check all channels EXCEPT Halts
             for channel_name, channel_stocks in live_data.items():
-                if channel_name == "Halts":  # NO SOUND for halted stocks
+                if channel_name == "Halts":
                     continue
                 if any(stock[0] == symbol for stock in channel_stocks):
                     ticker_on_channel = True
