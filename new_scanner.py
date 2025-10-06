@@ -1,6 +1,6 @@
 """
 SignalScan Enhanced - Full US Market Scanner
-Version 7.2 - Halts with Price/% + News (sound exempt)
+Version 7.2 - Halts with Price/% + News (sound exempt) + PyGame Audio
 """
 
 from kivy.app import App
@@ -12,7 +12,7 @@ from kivy.uix.popup import Popup
 from kivy.graphics import Color, Rectangle
 from kivy.clock import Clock
 from kivy.config import Config
-from kivy.core.audio import SoundLoader
+import pygame.mixer
 import datetime
 import pytz
 import os
@@ -36,73 +36,66 @@ NY_TZ = pytz.timezone('America/New_York')
 
 
 class SoundManager:
-    """Manages sound alerts"""
+    """Manages sound alerts using PyGame mixer"""
     def __init__(self):
+        # Initialize PyGame mixer for audio playback
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+        pygame.mixer.set_num_channels(8)  # Allow multiple sounds simultaneously
+        
         self.sounds = {}
-        self.sound_paths = {
-            'bell': 'sounds/nyse_bell.wav',
-            'news': 'sounds/iphone_news_flash.wav',
-            'premarket': 'sounds/woke_up_this_morning.wav',
-            'candidate': 'sounds/morse_code_alert.wav'
-        }
-        self.load_sounds()
+        self.sound_dir = "sounds"
         self.bell_played_open = False
         self.bell_played_close = False
         self.premarket_played = False
+        self._load_sounds()
 
-    def load_sounds(self):
-        try:
-            for name, path in self.sound_paths.items():
-                if os.path.exists(path):
-                    sound = SoundLoader.load(path)
-                    if sound:
-                        sound.loop = False
-                        self.sounds[name] = sound
-        except Exception as e:
-            print(f"Sound loading error: {e}")
+    def _load_sounds(self):
+        sound_files = {
+            'bell': 'nyse_bell.wav',
+            'news': 'iphone_news_flash.wav',
+            'premarket': 'woke_up_this_morning.wav',
+            'candidate': 'morse_code_alert.wav'
+        }
+        
+        for sound_name, filename in sound_files.items():
+            filepath = os.path.join(self.sound_dir, filename)
+            if os.path.exists(filepath):
+                try:
+                    self.sounds[sound_name] = pygame.mixer.Sound(filepath)
+                    print(f"✓ Loaded: {filename}")
+                except pygame.error as e:
+                    print(f"✗ Failed to load {filename}: {e}")
+            else:
+                print(f"✗ Missing: {filepath}")
+
+    def play_sound(self, sound_name):
+        if sound_name in self.sounds:
+            try:
+                self.sounds[sound_name].play()
+                print(f"♪ Playing: {sound_name}")
+            except Exception as e:
+                print(f"✗ Sound playback error for {sound_name}: {e}")
+        else:
+            print(f"✗ Sound not loaded: {sound_name}")
 
     def play_bell(self):
-        if self.sounds.get('bell'):
-            try:
-                self.sounds['bell'].stop()
-            except:
-                pass
-            self.sounds['bell'].play()
+        self.play_sound('bell')
+        print("[SOUND] NYSE Bell")
 
     def play_news_alert(self):
-        """MUTED - Succession theme disabled"""
-        #try:
-        #   if self.sounds.get('news'):
-        #        try:
-        #            self.sounds['news'].stop()
-        #            self.sounds['news'].unload()
-        #        except:
-        #            pass
-        #    
-        #    path = self.sound_paths['news']
-        #    if os.path.exists(path):
-        #        self.sounds['news'] = SoundLoader.load(path)
-        #        if self.sounds['news']:
-        #            self.sounds['news'].loop = False
-        #            self.sounds['news'].play()
-        #except Exception as e:
-        print("[SOUND] Breking News alert (muted)")
+        """MUTED - Breaking news alerts disabled"""
+        print("[SOUND] Breaking News alert (muted)")
 
     def play_premarket_alert(self):
-        if self.sounds.get('premarket'):
-            try:
-                self.sounds['premarket'].stop()
-            except:
-                pass
-            self.sounds['premarket'].play()
+        self.play_sound('premarket')
+        if 'premarket' in self.sounds:
+            print("[SOUND] Pre-market alert (Sopranos)")
+        else:
+            print("[SOUND] Pre-market alert (file missing)")
 
     def play_candidate_alert(self):
-        if self.sounds.get('candidate'):
-            try:
-                self.sounds['candidate'].stop()
-            except:
-                pass
-            self.sounds['candidate'].play()
+        self.play_sound('candidate')
+        print("[SOUND] HOD Candidate (Morse code)")
 
     def check_market_bells(self, now_est):
         market_open = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -118,19 +111,16 @@ class SoundManager:
             and premarket_alert <= now_est < premarket_alert + datetime.timedelta(seconds=10)):
             self.play_premarket_alert()
             self.premarket_played = True
-            print("[SOUND] Pre-market alert (7:00 AM ET)")
 
         if (not self.bell_played_open
             and market_open <= now_est < market_open + datetime.timedelta(seconds=10)):
             self.play_bell()
             self.bell_played_open = True
-            print("[SOUND] Market open bell (9:30 AM ET)")
 
         if (not self.bell_played_close
             and market_close <= now_est < market_close + datetime.timedelta(seconds=10)):
             self.play_bell()
             self.bell_played_close = True
-            print("[SOUND] Market close bell (4:00 PM ET)")
 
 
 class HaltManager:
@@ -385,7 +375,6 @@ class NewsManager:
             
             if ticker_on_channel and self.sound_manager_ref:
                 self.sound_manager_ref.play_news_alert()
-                print(f"[SOUND] Breaking news for {symbol}")
         except Exception as e:
             print(f"Sound check error: {e}")
 
@@ -638,7 +627,6 @@ class SignalScanApp(BoxLayout):
         """Update Halts channel with real halt data + price/% from scanner"""
         self.live_data["Halts"] = []
         for symbol, halt_info in halt_data.items():
-            # Get real-time price data from scanner if available
             stock_data = self.market_data.stock_data.get(symbol, {})
             price = stock_data.get('price', 0)
             change_pct = stock_data.get('change_pct', 0)
@@ -649,12 +637,12 @@ class SignalScanApp(BoxLayout):
             self.live_data["Halts"].append([
                 symbol,
                 halt_info['halt_time'],
-                halt_info['reason'][:20],  # Truncate for space
-                halt_info['resume_time'][:10],  # Truncate for space
+                halt_info['reason'][:20],
+                halt_info['resume_time'][:10],
                 halt_info['exchange'],
                 price_str,
                 pct_str,
-                ""  # News placeholder
+                ""
             ])
         Clock.schedule_once(lambda dt: self.refresh_data_table(), 0)
 
@@ -895,13 +883,12 @@ class SignalScanApp(BoxLayout):
         
         ticker = halt_data[0]
         
-        # Display first 7 columns (Symbol, Halt Time, Reason, Resume, Exchange, Price, %)
         for i, value in enumerate(halt_data[:7]):
-            if i == 0:  # Symbol
+            if i == 0:
                 text_color = (1, 0.3, 0.3, 1)
-            elif i == 5:  # Price
+            elif i == 5:
                 text_color = (0.9, 0.9, 0.9, 1)
-            elif i == 6:  # Percentage
+            elif i == 6:
                 try:
                     pct_str = str(value).replace('%', '').replace('+', '')
                     change_pct = float(pct_str)
@@ -913,7 +900,6 @@ class SignalScanApp(BoxLayout):
             
             row.add_widget(Label(text=str(value), font_size=12, color=text_color))
         
-        # News button (8th column)
         if ticker in self.stock_news:
             tier = self.stock_news[ticker].get('tier', 3)
             if tier == 2:
@@ -958,127 +944,108 @@ class SignalScanApp(BoxLayout):
                 btn.bind(on_release=lambda x, t=ticker, n=news_content: self.show_news_popup(t, n))
                 row.add_widget(btn)
             else:
-                row.add_widget(Label(text=str(value), font_size=14, color=text_color if i > 0 else (1, 1, 1, 1)))
+                row.add_widget(Label(text=str(value), font_size=14, color=text_color))
         return row
 
-    def show_news_popup(self, ticker, news_text):
-        content = BoxLayout(orientation="vertical", padding=20, spacing=15)
-        content.add_widget(Label(text=f"{ticker} - NEWS", font_size=18, bold=True,
-                                 size_hint=(1, None), height=40, color=(0, 1, 0, 1)))
-        content.add_widget(Label(text=news_text, font_size=14, text_size=(400, None),
-                                 halign="left", valign="middle", color=(0.9, 0.9, 0.9, 1)))
-        close_btn = Button(text="Close", size_hint=(1, None), height=40, background_color=(0, 0.8, 0, 1))
-        popup = Popup(title="", content=content, size_hint=(None, None), size=(450, 250),
-                      background_color=(0.15, 0.15, 0.15, 1))
-        close_btn.bind(on_release=popup.dismiss)
-        content.add_widget(close_btn)
-        popup.open()
-
-    def select_channel(self, channel):
+    def select_channel(self, channel_name):
+        self.current_channel = channel_name
         for ch, btn in self.channel_buttons.items():
-            btn.background_color = (0.25, 0.25, 0.25, 1)
-            btn.color = (0.7, 0.7, 0.7, 1)
-        self.channel_buttons[channel].background_color = (0, 0.8, 0, 1)
-        self.channel_buttons[channel].color = (1, 1, 1, 1)
-        self.current_channel = channel
+            if ch == channel_name:
+                btn.background_color = (0, 0.8, 0, 1)
+                btn.color = (1, 1, 1, 1)
+            else:
+                btn.background_color = (0.25, 0.25, 0.25, 1)
+                btn.color = (0.7, 0.7, 0.7, 1)
         self.update_header_labels()
         self.refresh_data_table()
 
+    def show_news_popup(self, ticker, news_text):
+        content = BoxLayout(orientation="vertical", padding=10, spacing=10)
+        content.add_widget(Label(text=f"{ticker} News:", font_size=18, size_hint=(1, 0.2), bold=True))
+        content.add_widget(Label(text=news_text, font_size=14, size_hint=(1, 0.6), text_size=(600, None)))
+        close_btn = Button(text="Close", size_hint=(1, 0.2))
+        content.add_widget(close_btn)
+        popup = Popup(title=f"{ticker}", content=content, size_hint=(0.8, 0.6))
+        close_btn.bind(on_release=popup.dismiss)
+        popup.open()
+
     def update_times(self, dt):
-        now_local = datetime.datetime.now()
-        self.local_time_label.text = "Local Time    " + now_local.strftime("%I:%M %p")
-
-        now_est = datetime.datetime.now(NY_TZ)
-
-        self.sound_manager.check_market_bells(now_est)
-
-        state, color = self.get_market_state_and_color(now_est)
+        local_time = datetime.datetime.now()
+        nyc_time = datetime.datetime.now(NY_TZ)
+        
+        self.local_time_label.text = f"Local Time    {local_time.strftime('%I:%M:%S %p')}"
+        self.nyc_time_label.text = f"NYC Time     {nyc_time.strftime('%I:%M:%S %p')}"
+        
+        state, color = self.get_market_state_and_color(nyc_time)
         self.market_state_label.text = state
         self.market_state_label.color = color
+        
+        countdown = self.get_countdown(nyc_time)
+        self.countdown_label.text = countdown
         self.countdown_label.color = color
-
-        nxt = self.get_next_change(now_est, state)
-        if nxt:
-            remaining = nxt - now_est
-            s = int(remaining.total_seconds())
-            h, m = divmod(s, 3600)
-            m, s = divmod(m, 60)
-            self.countdown_label.text = f"{h:02d}:{m:02d}:{s:02d}"
-        else:
-            self.countdown_label.text = "00:00:00"
-
-        self.nyc_time_label.text = "NYC Time     " + now_est.strftime("%I:%M %p")
+        
+        self.sound_manager.check_market_bells(nyc_time)
 
     def get_market_state_and_color(self, now_est):
-        market_open = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_est.replace(hour=16, minute=0, second=0, microsecond=0)
-        premkt_start = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
-        close_start = now_est.replace(hour=14, minute=0, second=0, microsecond=0)
-        after_end = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
-
-        wd = now_est.weekday()
-        state, color = "Closed", (1, 0, 0, 1)
-
-        if wd in (5, 6) or (wd == 4 and now_est >= market_close):
-            state, color = "Weekend", (1, 0.6, 0, 1)
-        elif premkt_start <= now_est < market_open:
-            state, color = "PreMarket", (0.2, 0.5, 1, 1)
-        elif market_open <= now_est < close_start:
-            state, color = "Market Open", (0, 1, 0, 1)
-        elif close_start <= now_est < market_close:
-            state, color = "Market Closes", (1, 1, 0, 1)
-        elif market_close <= now_est < after_end:
-            state, color = "After Hours", (0.2, 0.5, 1, 1)
-
-        return state, color
-
-    def get_next_change(self, now_est, state):
-        times = []
-        wd = now_est.weekday()
-
-        if state == "PreMarket":
-            times.append(now_est.replace(hour=9, minute=30, second=0, microsecond=0))
-        elif state == "Market Open":
-            times.append(now_est.replace(hour=14, minute=0, second=0, microsecond=0))
-        elif state == "Market Closes":
-            times.append(now_est.replace(hour=16, minute=0, second=0, microsecond=0))
-        elif state == "After Hours":
-            times.append(now_est.replace(hour=19, minute=0, second=0, microsecond=0))
-        elif state == "Weekend":
-            if wd == 5:
-                monday = now_est + datetime.timedelta(days=2)
-                times.append(monday.replace(hour=4, minute=0, second=0, microsecond=0))
-            elif wd == 6:
-                monday = now_est + datetime.timedelta(days=1)
-                times.append(monday.replace(hour=4, minute=0, second=0, microsecond=0))
-            elif wd == 4 and now_est.hour >= 16:
-                monday = now_est + datetime.timedelta(days=3)
-                times.append(monday.replace(hour=4, minute=0, second=0, microsecond=0))
+        day_of_week = now_est.weekday()
+        if day_of_week >= 5:
+            return "Weekend", (1, 0.6, 0, 1)
+        
+        if now_est.hour < 4:
+            return "Closed", (1, 0.6, 0, 1)
+        elif now_est.hour == 4 or (now_est.hour < 9) or (now_est.hour == 9 and now_est.minute < 30):
+            return "PreMarket", (0, 1, 1, 1)
+        elif (now_est.hour == 9 and now_est.minute >= 30) or (9 < now_est.hour < 16):
+            return "Market Open", (0, 1, 0, 1)
+        elif now_est.hour >= 16 and now_est.hour < 20:
+            return "After Hours", (1, 1, 0, 1)
         else:
-            if now_est.hour >= 19:
-                nxt = now_est + datetime.timedelta(days=1)
-                while nxt.weekday() >= 5:
-                    nxt += datetime.timedelta(days=1)
-                times.append(nxt.replace(hour=4, minute=0, second=0, microsecond=0))
-            else:
-                times.append(now_est.replace(hour=4, minute=0, second=0, microsecond=0))
+            return "Closed", (1, 0.6, 0, 1)
 
-        times = [t for t in times if t > now_est]
-        return times[0] if times else None
+    def get_countdown(self, now_est):
+        day_of_week = now_est.weekday()
+        
+        if day_of_week >= 5:
+            days_until_monday = (7 - day_of_week) % 7
+            if days_until_monday == 0:
+                days_until_monday = 1
+            next_open = now_est.replace(hour=4, minute=0, second=0, microsecond=0) + datetime.timedelta(days=days_until_monday)
+            delta = next_open - now_est
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        
+        if now_est.hour < 4:
+            target = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
+        elif now_est.hour < 9 or (now_est.hour == 9 and now_est.minute < 30):
+            target = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+        elif now_est.hour < 16:
+            target = now_est.replace(hour=16, minute=0, second=0, microsecond=0)
+        elif now_est.hour < 20:
+            target = now_est.replace(hour=20, minute=0, second=0, microsecond=0)
+        else:
+            target = (now_est + datetime.timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+        
+        delta = target - now_est
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def exit_app(self, instance):
-        self.market_data.stop()
-        if self.news_manager:
-            self.news_manager.stop()
-        if self.halt_manager:
+        try:
+            self.market_data.stop()
+            if self.news_manager:
+                self.news_manager.stop()
             self.halt_manager.stop()
+        except:
+            pass
         App.get_running_app().stop()
 
 
-class SignalScanMainApp(App):
+class SignalScanEnhancedApp(App):
     def build(self):
         return SignalScanApp()
 
 
 if __name__ == '__main__':
-    SignalScanMainApp().run()
+    SignalScanEnhancedApp().run()
