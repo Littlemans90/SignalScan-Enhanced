@@ -3341,13 +3341,8 @@ class SignalScanApp(BoxLayout):
             Clock.schedule_once(self.start_news_feed, 5)
             return
 
-        self.news_manager = NewsManager(
-            callback=self.on_news_update,
-            sound_manager_ref=self.sound_manager,
-            # Load prefiltered watchlist from Alpaca validation
         # Load prefiltered watchlist from Alpaca validation
         validated_file = "alpaca_validated.json"
-        )
         try:
             with open(validated_file, 'r') as f:
                 prefiltered = json.load(f)
