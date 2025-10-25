@@ -463,7 +463,7 @@ class HaltManager:
                 if not symbol or len(symbol) > 5:
                     continue
                 
-                if symbol not in self.halt_:
+                if symbol not in self.halt_data:
                     self.halt_data[symbol] = []
                     
                 record = {
@@ -481,116 +481,6 @@ class HaltManager:
 
     def stop(self):
         self.running = False
-    
-    def _fetch_nasdaq_halts(self):
-        """Fetch from Nasdaq RSS"""
-        try:
-            r = requests.get(self.rss_url, timeout=10)
-            r.raise_for_status()
-            halt_logger.info(f"Nasdaq RSS fetch: {r.status_code}, {len(r.content)} bytes")
-            
-            root = ET.fromstring(r.content)
-            items = root.findall('.//item')
-            halt_logger.info(f"Found {len(items)} items in RSS feed")
-            
-            today_et = datetime.datetime.now(NY_TZ).date()
-            
-            for item in items:
-                try:
-                    title = item.find('title').text or ''
-                    description = item.find('description').text or ''
-                    pub_date = item.find('pubDate').text or ''
-                    
-                    halt_logger.debug(f"Processing item: title='{title[:50]}', desc='{description[:50]}'")
-                    
-                    if len(title) < 2 or title.startswith('-'):
-                        halt_logger.debug(f"SKIP: invalid title")
-                        continue
-                    
-                    try:
-                        pub_datetime = parsedate_to_datetime(pub_date)
-                        pub_datetime_et = pub_datetime.astimezone(NY_TZ)
-                    except Exception as e:
-                        halt_logger.debug(f"SKIP: date parse error - {e}")
-                        continue
-
-                    parts = description.split('::')
-                    if len(parts) >= 4:
-                        symbol = parts[0].strip()
-                        halt_time = parts[1].strip()
-                        reason = parts[2].strip()
-                        resume_time = parts[3].strip() if len(parts) > 3 else 'Pending'
-                    else:
-                        words = description.split()
-                        symbol = words[0] if words else 'UNK'
-                        halt_time = pub_datetime_et.strftime('%I:%M %p ET')
-                        reason = description[:50]
-                        resume_time = 'Pending'
-                    
-                    halt_logger.debug(f"Parsed: symbol={symbol}, halt_time={halt_time}")
-                    
-                    exchange = 'NASDAQ'
-                    if 'NYSE' in description.upper() or 'NYSE' in title.upper():
-                        exchange = 'NYSE'
-                    elif 'AMEX' in description.upper():
-                        exchange = 'AMEX'
-
-                    if symbol not in self.halt_data:
-                        self.halt_data[symbol] = []
-                    self.halt_data[symbol].append({'symbol': symbol, 'halt_time': halt_time, 'reason': reason, 'resume_time': resume_time, 'exchange': exchange})
-                    halt_logger.info(f"✓ ADDED HALT: {symbol} at {halt_time} - {reason}")
-                    
-                except Exception as e:
-                    halt_logger.error(f"Item processing error: {e}")
-                    continue
-                    
-            halt_logger.info(f"Nasdaq fetch complete: {len(self.halt_data)} symbols added")
-        except Exception as e:
-            halt_logger.error(f"Nasdaq RSS error: {e}")
-            print(f"[Nasdaq RSS error] {e}")
-    
-    def _fetch_nyse_halts(self):
-        """Fetch from NYSE API (backup source)"""
-        try:
-            today = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d')
-            url = self.nyse_url.format(date=today)
-            
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            
-            lines = r.text.strip().split('\n')
-            if len(lines) < 2:
-                return
-                
-            for line in lines[1:]:
-                parts = line.split(',')
-                if len(parts) < 6:
-                    continue
-                    
-                symbol = parts[1].strip().strip('"')
-                halt_time = parts[2].strip().strip('"')
-                resume_time = parts[3].strip().strip('"') or "Pending"
-                reason = parts[4].strip().strip('"')
-                
-                if not symbol or len(symbol) > 5:
-                    continue
-                
-                if symbol not in self.halt_:
-                    self.halt_data[symbol] = []
-                    
-                record = {
-                    'symbol': symbol,
-                    'halt_time': halt_time,
-                    'reason': reason,
-                    'resume_time': resume_time,
-                    'exchange': 'NYSE'
-                }
-                self.halt_data[symbol].append(record)
-                print(f"[NYSE-HALT] {symbol} added: {halt_time}, {reason}, resume: {resume_time}")
-                    
-        except Exception as e:
-            print(f"[NYSE API error] {e}")
-
 
 class NewsManager:
     def __init__(self, callback, sound_manager_ref, watchlist=None, news_trigger_callback=None):
@@ -1952,7 +1842,8 @@ class EnrichmentManager:
         
         if gate_triggered:
             self.promote_ticker(symbol, gate_triggered, score_bonus)
-
+            return gate_triggered
+        
     def promote_ticker(self, symbol, reason, score_bonus):
         now_str = datetime.datetime.now(NY_TZ).isoformat()
         if symbol not in self.enriched:
@@ -2355,6 +2246,14 @@ class MarketDataManager:
         self.tier1_shortlist_queue = queue.Queue()
         self.tier2_validated_queue = queue.Queue()
         self.stock_data = {}
+        self.candidate_alerted = set()
+        self.tradier_price_history = {}
+        self.tradier_ws = None
+        self.tradier_session_id = None
+        self.current_tradier_symbols = []
+        self.alpaca_ws = None
+        self.current_alpaca_symbols = []
+        self.alpaca_validated_data = {}
         self.price_history = {}
         self.yesterday_prices = {}
         self.all_tickers = []
@@ -2795,21 +2694,43 @@ class MarketDataManager:
                 bid = data.get("bid")
                 ask = data.get("ask")
                 volume = data.get("volume")
-                timestamp = data.get("time")
                 
                 if not last_price:
                     return
                 
-                # Update stock data
+                # Get previous data from Tier 2 validation
                 if symbol not in self.stock_data:
-                    self.stock_data[symbol] = {}
+                    return
                 
+                prev_data = self.stock_data[symbol]
+                prev_close = prev_data.get('prev_close', last_price)
+                
+                # Calculate change_pct
+                change_pct = ((last_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+                
+                # Calculate RVol
+                avg_volume = prev_data.get('avg_volume', 0)
+                rvol = (volume / avg_volume) if avg_volume > 0 else 0
+                
+                # Check for new HOD
+                day_high = max(prev_data.get('day_high', 0), last_price)
+                is_new_hod = last_price >= day_high and last_price > prev_close
+                
+                # Update with ALL required fields
                 self.stock_data[symbol].update({
                     "symbol": symbol,
                     "current_price": last_price,
+                    "change_pct": change_pct,
                     "bid": bid,
                     "ask": ask,
                     "volume": volume,
+                    "rvol": rvol,
+                    "cbvol": data.get("last_size", prev_data.get('cbvol', 0)),
+                    "float": prev_data.get('float', 0),
+                    "avg_volume": avg_volume,
+                    "is_new_hod": is_new_hod,
+                    "day_high": day_high,
+                    "prev_close": prev_close,
                     "last_update": datetime.datetime.now().isoformat(),
                     "tier3_active": True
                 })
@@ -2820,7 +2741,9 @@ class MarketDataManager:
                     self.tradier_price_history[symbol] = []
                 
                 self.tradier_price_history[symbol].append({
-                    "price": float(last_price), "timestamp": now})
+                    "price": float(last_price), 
+                    "timestamp": now
+                })
                 
                 # Keep only last 10 minutes of data
                 cutoff = now - 600
@@ -2832,12 +2755,13 @@ class MarketDataManager:
                 # Detect quick moves
                 self._detect_quick_moves(symbol, last_price)
                 
-                # Run categorization engine on this ticker
+                # Run categorization engine
                 self._run_categorization(symbol)
                 
             except Exception as e:
                 print(f"[TIER3] Message processing error: {e}")
                 scanner_logger.error(f"[TIER3] Message processing error: {e}")
+
         
         def on_error(ws, error):
             print(f"[TIER3] WebSocket error: {error}")
@@ -2931,7 +2855,6 @@ class MarketDataManager:
                 traceback.print_exc()
                 time.sleep(10)
 
-    
     def _tradier_subscribe(self, ws, symbols, session_id):
         """Helper method to subscribe to Tradier symbols"""
         try:
@@ -3036,37 +2959,46 @@ class MarketDataManager:
         """Run categorization engine on updated ticker data"""
         try:
             if symbol not in self.stock_data:
-                scanner_logger.error(f"[TIER3] {symbol} not in stock_data")
                 return
-        
-            # Get stock data
+    
             data = self.stock_data[symbol]
-            current_price = data.get('current_price', 0) or 0
-            volume = data.get('volume', 0) or 0
-        
-            if not current_price or current_price == 0:
-                return
-        
-            # Get enrichment data from stock_data
-            changepct = data.get('changepct', 0)
+            current_price = data.get('current_price', 0)
+            volume = data.get('volume', 0)
+            change_pct = data.get('change_pct', 0)
             rvol = data.get('rvol', 0)
-            floatshares = data.get('floatshares', 0)
-            isnewhod = data.get('isnewhod', False)
-            
-            # Call the REAL categorization function from EnrichmentManager
-            channel = self.enrichment_manager_ref.check_gates(
-                symbol=symbol,
-                price=current_price,
-                change_pct=changepct,
-                rvol=rvol,
-                volume=volume,
-                float_shares=floatshares,
-                is_new_hod=isnewhod
-            )
+            float_shares = data.get('float', 0)
+            is_new_hod = data.get('is_new_hod', False)
+        
+            # Format as stock_data tuple for categorize_stock
+            formatted = [
+                symbol, 
+                get_timestamp_display(symbol), 
+                f"${current_price:.2f}", 
+                f"{change_pct:+.1f}%",
+                self.format_volume(data.get('cbvol', 0)),
+                self.format_volume(volume), 
+                f"{float_shares:.1f}M",
+                f"{rvol:.2f}x",
+                "NEWS"
+            ]
+        
+            # Call the REAL categorization function from SignalScanApp
+            app = App.get_running_app()
+            if hasattr(app, 'root'):
+                app.root.categorize_stock(
+                    formatted, 
+                    change_pct, 
+                    volume, 
+                    rvol, 
+                    float_shares, 
+                    current_price, 
+                    is_new_hod, 
+                    False  # is_52wk_high
+                )
 
-            # If no channel assigned by categorization, skip GUI update
-            if not channel:
-                return
+                # If no channel assigned by categorization, skip GUI update
+                if not channel:
+                    return
         
             # Pass to GUI with channel assignment
             if channel and self.callback:
@@ -3587,7 +3519,7 @@ class SignalScanApp(BoxLayout):
             symbol = alert_info['symbol']
             
             # Check if halt is in current halt_data
-            if symbol in self.halt_manager.halt_:
+            if symbol in self.halt_manager.halt_data:
                 halt_list = self.halt_manager.halt_data[symbol]
                 
                 for halt in halt_list:
@@ -4206,27 +4138,6 @@ class SignalScanApp(BoxLayout):
             tabs_container.add_widget(btn)
         
         return tabs_container
-
-    def build_data_section(self):
-        data_section = BoxLayout(orientation="vertical", spacing=0, padding=[15, 10, 15, 10])
-        
-        self.header_layout = BoxLayout(orientation="horizontal", size_hint=(1, None), height=35)
-        with self.header_layout.canvas.before:
-            Color(0.15, 0.15, 0.15, 1)
-            self.header_layout.bg_rect = Rectangle(size=self.header_layout.size, pos=self.header_layout.pos)
-        self.header_layout.bind(size=lambda inst, val: setattr(self.header_layout.bg_rect, "size", inst.size))
-        self.header_layout.bind(pos=lambda inst, val: setattr(self.header_layout.bg_rect, "pos", inst.pos))
-        
-        self.update_header_labels()
-        data_section.add_widget(self.header_layout)
-        
-        self.scroll_view = ScrollView(size_hint=(1, 1))
-        self.rows_container = BoxLayout(orientation="vertical", size_hint_y=None, spacing=2)
-        self.rows_container.bind(minimum_height=self.rows_container.setter('height'))
-        self.scroll_view.add_widget(self.rows_container)
-        data_section.add_widget(self.scroll_view)
-        
-        return data_section
 
     def update_header_labels(self):
         self.header_layout.clear_widgets()
